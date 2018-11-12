@@ -4,17 +4,15 @@ Author:   Qiuqiang Kong
 Created:  2017.12.22
 Modified: -
 """
+
 import numpy as np
 import os
 import pickle
-import cPickle
 import h5py
 import argparse
 import time
 import glob
-import matplotlib.pyplot as plt
 
-import prepare_data as pp_data
 import config as cfg
 from data_generator import DataGenerator
 from spectrogram_to_wave import recover_wav
@@ -23,6 +21,9 @@ from keras.models import Sequential
 from keras.layers import Dense, Dropout, Flatten
 from keras.optimizers import Adam
 from keras.models import load_model
+
+import audio_utils
+from system_utils import load_hdf5
 
 
 def eval(model, gen, x, y):
@@ -47,9 +48,15 @@ def eval(model, gen, x, y):
     y_all = np.concatenate(y_all, axis=0)
     
     # Compute loss. 
-    loss = pp_data.np_mean_absolute_error(y_all, pred_all)
+    loss = audio_utils.np_mean_absolute_error(y_all, pred_all)
     return loss
-    
+
+
+def save_training_stats(iteration, tr_loss, te_loss, stats_dir):
+    stat_dict = {'iter': iteration, 'tr_loss': tr_loss, 'te_loss': te_loss}
+    stat_path = os.path.join(stats_dir, "{}iters.pickle".format(iteration))
+    pickle.dump(stat_dict, open(stat_path, "wb"), protocol=pickle.HIGHEST_PROTOCOL)
+
 
 def train(args):
     """Train the neural network. Write out model every several iterations. 
@@ -68,12 +75,16 @@ def train(args):
     
     # Load data. 
     t1 = time.time()
+
     tr_hdf5_path = os.path.join(workspace, "packed_features", "spectrogram", "train", "%ddb" % int(tr_snr), "data.h5")
     te_hdf5_path = os.path.join(workspace, "packed_features", "spectrogram", "test", "%ddb" % int(te_snr), "data.h5")
-    (tr_x, tr_y) = pp_data.load_hdf5(tr_hdf5_path)
-    (te_x, te_y) = pp_data.load_hdf5(te_hdf5_path)
+
+    (tr_x, tr_y) = load_hdf5(tr_hdf5_path)
+    (te_x, te_y) = load_hdf5(te_hdf5_path)
+
     print(tr_x.shape, tr_y.shape)
     print(te_x.shape, te_y.shape)
+
     print("Load data time: %s s" % (time.time() - t1,))
     
     batch_size = 500
@@ -82,20 +93,16 @@ def train(args):
     # Scale data. 
     if True:
         t1 = time.time()
-        scaler_path = os.path.join(workspace, "packed_features", "spectrogram", "train", "%ddb" % int(tr_snr), "scaler.p")
+
+        scaler_path = os.path.join(workspace, "packed_features", "spectrogram", "train", "%ddb" % int(tr_snr), "scaler.pickle")
         scaler = pickle.load(open(scaler_path, 'rb'))
-        tr_x = pp_data.scale_on_3d(tr_x, scaler)
-        tr_y = pp_data.scale_on_2d(tr_y, scaler)
-        te_x = pp_data.scale_on_3d(te_x, scaler)
-        te_y = pp_data.scale_on_2d(te_y, scaler)
+        tr_x = audio_utils.scale_on_3d(tr_x, scaler)
+        tr_y = audio_utils.scale_on_2d(tr_y, scaler)
+        te_x = audio_utils.scale_on_3d(te_x, scaler)
+        te_y = audio_utils.scale_on_2d(te_y, scaler)
+
         print("Scale data time: %s s" % (time.time() - t1,))
-        
-    # Debug plot. 
-    if False:
-        plt.matshow(tr_x[0 : 1000, 0, :].T, origin='lower', aspect='auto', cmap='jet')
-        plt.show()
-        pause
-        
+
     # Build model
     (_, n_concat, n_freq) = tr_x.shape
     n_hid = 2048
@@ -111,8 +118,7 @@ def train(args):
     model.add(Dense(n_freq, activation='linear'))
     model.summary()
     
-    model.compile(loss='mean_absolute_error',
-                  optimizer=Adam(lr=lr))
+    model.compile(loss='mean_absolute_error', optimizer=Adam(lr=lr))
 
     # Data generator. 
     tr_gen = DataGenerator(batch_size=batch_size, type='train')
@@ -133,12 +139,8 @@ def train(args):
     print("Iteration: %d, tr_loss: %f, te_loss: %f" % (iter, tr_loss, te_loss))
     
     # Save out training stats. 
-    stat_dict = {'iter': iter, 
-                    'tr_loss': tr_loss, 
-                    'te_loss': te_loss, }
-    stat_path = os.path.join(stats_dir, "%diters.p" % iter)
-    cPickle.dump(stat_dict, open(stat_path, 'wb'), protocol=cPickle.HIGHEST_PROTOCOL)
-    
+    save_training_stats(iter, tr_loss, te_loss, stats_dir)
+
     # Train. 
     t1 = time.time()
     for (batch_x, batch_y) in tr_gen.generate(xs=[tr_x], ys=[tr_y]):
@@ -152,12 +154,8 @@ def train(args):
             print("Iteration: %d, tr_loss: %f, te_loss: %f" % (iter, tr_loss, te_loss))
             
             # Save out training stats. 
-            stat_dict = {'iter': iter, 
-                         'tr_loss': tr_loss, 
-                         'te_loss': te_loss, }
-            stat_path = os.path.join(stats_dir, "%diters.p" % iter)
-            cPickle.dump(stat_dict, open(stat_path, 'wb'), protocol=cPickle.HIGHEST_PROTOCOL)
-            
+            save_training_stats(iter, tr_loss, te_loss, stats_dir)
+
         # Save model. 
         if iter % 5000 == 0:
             model_path = os.path.join(model_dir, "md_%diters.h5" % iter)
@@ -169,98 +167,88 @@ def train(args):
             
     print("Training time: %s s" % (time.time() - t1,))
 
-def inference(args):
+
+def inference(workspace, train_snr, test_snr, n_concat, iteration, visualize):
     """Inference all test data, write out recovered wavs to disk. 
     
     Args:
-      workspace: str, path of workspace. 
-      tr_snr: float, training SNR. 
-      te_snr: float, testing SNR. 
+      workspace: str, path of workspace.
+      train_snr: float, training SNR.
+      test_snr: float, testing SNR.
       n_concat: int, number of frames to concatenta, should equal to n_concat 
           in the training stage. 
-      iter: int, iteration of model to load. 
+      iteration: int, iteration of model to load.
       visualize: bool, plot enhanced spectrogram for debug. 
     """
-    print(args)
-    workspace = args.workspace
-    tr_snr = args.tr_snr
-    te_snr = args.te_snr
-    n_concat = args.n_concat
-    iter = args.iteration
-    
+    begin_time = time.time()
+
     n_window = cfg.n_window
     n_overlap = cfg.n_overlap
     fs = cfg.sample_rate
     scale = True
     
     # Load model. 
-    model_path = os.path.join(workspace, "models", "%ddb" % int(tr_snr), "md_%diters.h5" % iter)
+    model_path = os.path.join(workspace, "models", "{}db".format(int(train_snr)), "md_{}iters.h5".format(iteration))
     model = load_model(model_path)
     
     # Load scaler. 
-    scaler_path = os.path.join(workspace, "packed_features", "spectrogram", "train", "%ddb" % int(tr_snr), "scaler.p")
-    scaler = pickle.load(open(scaler_path, 'rb'))
+    scaler_path = os.path.join(workspace, "packed_features", "spectrogram", "train", "{}db".format(int(train_snr)),
+                               "scaler.pickle")
+    scaler = pickle.load(open(scaler_path, "rb"))
     
     # Load test data. 
-    feat_dir = os.path.join(workspace, "features", "spectrogram", "test", "%ddb" % int(te_snr))
-    names = os.listdir(feat_dir)
+    features_dir = os.path.join(workspace, "features", "spectrogram", "test", "{}db".format(int(test_snr)))
 
-    for (cnt, na) in enumerate(names):
+    for sample_id, feature_filename in enumerate(os.listdir(features_dir)):
         # Load feature. 
-        feat_path = os.path.join(feat_dir, na)
-        data = cPickle.load(open(feat_path, 'rb'))
-        [mixed_cmplx_x, speech_x, noise_x, alpha, na] = data
-        mixed_x = np.abs(mixed_cmplx_x)
+        feature_path = os.path.join(features_dir, feature_filename)
+        feature_data = pickle.load(open(feature_path, "rb"))
+
+        mixed_audio_complex_spectrogram, speech_spectrogram, noise_spectrogram, alpha, rule_name = feature_data
+        mixed_audio_spectrogram = np.abs(mixed_audio_complex_spectrogram)
         
         # Process data. 
         n_pad = (n_concat - 1) / 2
-        mixed_x = pp_data.pad_with_border(mixed_x, n_pad)
-        mixed_x = pp_data.log_sp(mixed_x)
-        speech_x = pp_data.log_sp(speech_x)
+        mixed_audio_spectrogram = audio_utils.pad_with_border(mixed_audio_spectrogram, n_pad)
+        mixed_audio_spectrogram = audio_utils.log_sp(mixed_audio_spectrogram)
+        speech_spectrogram = audio_utils.log_sp(speech_spectrogram)
         
         # Scale data. 
         if scale:
-            mixed_x = pp_data.scale_on_2d(mixed_x, scaler)
-            speech_x = pp_data.scale_on_2d(speech_x, scaler)
+            mixed_audio_spectrogram = audio_utils.scale_on_2d(mixed_audio_spectrogram, scaler)
+            speech_spectrogram = audio_utils.scale_on_2d(speech_spectrogram, scaler)
         
-        # Cut input spectrogram to 3D segments with n_concat. 
-        mixed_x_3d = pp_data.mat_2d_to_3d(mixed_x, agg_num=n_concat, hop=1)
+        # Cut input spectrogram to 3D segments with n_concat.
+        mixed_audio_spectrogram_3d = audio_utils.mat_2d_to_3d(mixed_audio_spectrogram, agg_num=n_concat, hop=1)
         
         # Predict. 
-        pred = model.predict(mixed_x_3d)
-        print(cnt, na)
-        
-        # Inverse scale. 
+        prediction = model.predict(mixed_audio_spectrogram_3d)
+        print("Sample id: {}. sample name: {}".format(sample_id, rule_name))
+
+        # Inverse scale.
         if scale:
-            mixed_x = pp_data.inverse_scale_on_2d(mixed_x, scaler)
-            speech_x = pp_data.inverse_scale_on_2d(speech_x, scaler)
-            pred = pp_data.inverse_scale_on_2d(pred, scaler)
-        
-        # Debug plot. 
-        if args.visualize:
-            fig, axs = plt.subplots(3,1, sharex=False)
-            axs[0].matshow(mixed_x.T, origin='lower', aspect='auto', cmap='jet')
-            axs[1].matshow(speech_x.T, origin='lower', aspect='auto', cmap='jet')
-            axs[2].matshow(pred.T, origin='lower', aspect='auto', cmap='jet')
-            axs[0].set_title("%ddb mixture log spectrogram" % int(te_snr))
-            axs[1].set_title("Clean speech log spectrogram")
-            axs[2].set_title("Enhanced speech log spectrogram")
-            for j1 in xrange(3):
-                axs[j1].xaxis.tick_bottom()
-            plt.tight_layout()
-            plt.show()
+            mixed_speech_spectrogram = audio_utils.inverse_scale_on_2d(mixed_audio_spectrogram, scaler)
+            speech_spectrogram = audio_utils.inverse_scale_on_2d(speech_spectrogram, scaler)
+            prediction = audio_utils.inverse_scale_on_2d(prediction, scaler)
 
         # Recover enhanced wav. 
-        pred_sp = np.exp(pred)
-        s = recover_wav(pred_sp, mixed_cmplx_x, n_overlap, np.hamming)
-        s *= np.sqrt((np.hamming(n_window)**2).sum())   # Scaler for compensate the amplitude 
-                                                        # change after spectrogram and IFFT. 
-        
-        # Write out enhanced wav. 
-        out_path = os.path.join(workspace, "enh_wavs", "test", "%ddb" % int(te_snr), "%s.enh.wav" % na)
-        pp_data.create_folder(os.path.dirname(out_path))
-        pp_data.write_audio(out_path, s, fs)
-        
+        prediction_spectrogram = np.exp(prediction)
+        recovered_wave = recover_wav(prediction_spectrogram, mixed_audio_complex_spectrogram, n_overlap, np.hamming)
+
+        # Scaler for compensate the amplitude change after spectrogram and IFFT.
+        recovered_wave *= np.sqrt((np.hamming(n_window)**2).sum())
+
+        # Write out enhanced wav.
+        enhanced_audio_filename = "{}.enh.wav".format(rule_name)
+        enhanced_audio_dir = os.path.join(workspace, "enhanced_wavs", "test", "{}db".format(int(test_snr)))
+
+        audio_utils.create_directory(enhanced_audio_dir)
+        audio_utils.write_audio(os.path.join(enhanced_audio_dir, enhanced_audio_filename), recovered_wave, fs)
+
+    print()
+    print("Inference time: {}".format(time.time() - begin_time))
+    print()
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -289,8 +277,17 @@ if __name__ == '__main__':
     
     if args.mode == 'train':
         train(args)
+
     elif args.mode == 'inference':
-        inference(args)
+        workspace = args.workspace
+        train_snr = args.tr_snr
+        test_snr = args.te_snr
+        n_concat = args.n_concat
+        iteration = args.iteration
+        visualize = args.visualize
+
+        inference(workspace, train_snr, test_snr, n_concat, iteration, visualize)
+
     elif args.mode == 'calculate_pesq':
         calculate_pesq(args)
     else:

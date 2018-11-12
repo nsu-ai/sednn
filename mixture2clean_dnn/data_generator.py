@@ -1,5 +1,6 @@
 import numpy as np
 
+
 class DataGenerator(object):
     def __init__(self, batch_size, type, te_max_iter=None):
         assert type in ['train', 'test']
